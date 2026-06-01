@@ -418,6 +418,13 @@ async function buildContainerArgs(
     }
   }
 
+  // Per-group env vars from container config.
+  if (containerConfig.envVars) {
+    for (const [key, value] of Object.entries(containerConfig.envVars)) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
+
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
   // are routed through the agent vault for credential injection. Treated as
   // a transient hard failure: if we can't wire the gateway, we don't spawn.
