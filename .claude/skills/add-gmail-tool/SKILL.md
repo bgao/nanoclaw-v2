@@ -11,19 +11,26 @@ Tools exposed (from `gmail-mcp@1.1.11`, surfaced to the agent as `mcp__gmail__<n
 
 **Why this pattern:** v2's invariant is that containers never receive raw API keys — OneCLI is the sole credential path (see CHANGELOG v2.0.0). The stub-file pattern satisfies this: the container sees `"onecli-managed"` placeholders, the gateway swaps them in flight.
 
+**How OneCLI injects Gmail credentials:** Gmail OAuth is stored as an `AppConnection` in OneCLI's Postgres DB (not as a `Secret`). `secretMode` on the agent does *not* affect Gmail injection — what matters is a row in `agent_app_connections` linking the agent to the Gmail connection. This skill creates that link. See Phase 1.
+
 ## Phase 1: Pre-flight
 
 ### Verify OneCLI has Gmail connected
 
+The `onecli` CLI (v1.1.1) does not have an `apps` subcommand. Check the Postgres DB directly:
+
 ```bash
-onecli apps get --provider gmail
+docker exec onecli-postgres-1 psql -U onecli -d onecli \
+  -c "SELECT provider, status, updated_at FROM app_connections WHERE provider = 'gmail';"
 ```
 
-Expected: `"connection": { "status": "connected" }` with scopes including `gmail.readonly`, `gmail.modify`, `gmail.send`.
+Expected: one row with `status = connected`.
 
-If not connected, tell the user:
+If no row is returned, tell the user:
 
-> Open the OneCLI web UI at http://127.0.0.1:10254, go to Apps → Gmail, and click Connect. Sign in with the Google account you want the agent to act as.
+> Open the OneCLI web UI at http://127.0.0.1:10254, go to Apps → Gmail, and click Connect. Sign in with the Google account you want the agent to act as. Come back when done.
+
+Once connected, verify the granted scopes cover what the agent needs. The OneCLI web UI shows the scopes on the Gmail app detail page. At minimum you need `gmail.readonly`, `gmail.modify`, and `gmail.send`. If scopes are missing, disconnect and reconnect to get a fresh consent screen — there is no way to add scopes to an existing connection without re-authorizing.
 
 ### Verify stub credentials exist
 
@@ -74,23 +81,44 @@ cat ~/.config/nanoclaw/mount-allowlist.json
 
 `~/.gmail-mcp` must sit under an `allowedRoots` entry (e.g. `/home/<user>`). If it doesn't, tell the user to run `/manage-mounts` first or add their home directory.
 
-### Check agent secret-mode
+### Link each target agent to the Gmail connection
 
-For each target agent group, confirm OneCLI will inject Gmail secrets into its container. Find the OneCLI agent ID that matches the group's `agentGroupId`:
-
-```bash
-onecli agents list
-```
-
-If that agent's `secretMode` is `all`, you're done — Gmail secrets (identified by OneCLI's Gmail hostPattern) will auto-inject. If it's `selective`, explicitly assign the Gmail secrets using the safe merge pattern (`set-secrets` replaces the entire list — always read first):
+Gmail credentials are injected via `agent_app_connections`, not `secretMode`. For each agent group that should have Gmail, find the OneCLI agent ID matching the group's `agentGroupId` and link it:
 
 ```bash
-GMAIL_IDS=$(onecli secrets list | jq -r '[.data[] | select(.name | test("(?i)gmail")) | .id] | join(",")')
-CURRENT=$(onecli agents secrets --id <agent-id> | jq -r '[.data[]] | join(",")')
-MERGED=$(printf '%s' "$CURRENT,$GMAIL_IDS" | tr ',' '\n' | sort -u | paste -sd ',' -)
-onecli agents set-secrets --id <agent-id> --secret-ids "$MERGED"
-onecli agents secrets --id <agent-id>
+# Get the Gmail connection ID and OneCLI agent ID
+docker exec onecli-postgres-1 psql -U onecli -d onecli -c "
+SELECT ac.id AS connection_id, ac.provider, ac.status,
+       a.id AS agent_id, a.name AS agent_name, aac.agent_id AS already_linked
+FROM app_connections ac
+LEFT JOIN agent_app_connections aac ON ac.id = aac.app_connection_id
+LEFT JOIN agents a ON aac.agent_id = a.id
+WHERE ac.provider = 'gmail';"
 ```
+
+Cross-reference with `onecli agents list` to find the agent IDs for your target groups.
+
+If the target agent is not already linked (no row in the join), insert it:
+
+```bash
+docker exec onecli-postgres-1 psql -U onecli -d onecli -c "
+INSERT INTO agent_app_connections (agent_id, app_connection_id, updated_at)
+VALUES ('<onecli-agent-id>', '<gmail-connection-id>', NOW())
+ON CONFLICT DO NOTHING;"
+```
+
+Verify:
+
+```bash
+docker exec onecli-postgres-1 psql -U onecli -d onecli -c "
+SELECT a.name, ac.provider, ac.status
+FROM agent_app_connections aac
+JOIN agents a ON aac.agent_id = a.id
+JOIN app_connections ac ON aac.app_connection_id = ac.id
+WHERE ac.provider = 'gmail';"
+```
+
+**Note:** `secretMode` (`all` vs `selective`) only controls *Secret* injection (API keys). It has no effect on AppConnection injection. You do not need to call `onecli agents set-secrets` for Gmail.
 
 ## Phase 2: Apply Code Changes
 
@@ -103,13 +131,13 @@ echo "ALREADY APPLIED — skip to Phase 3"
 
 ### Add MCP server to Dockerfile
 
-Edit `container/Dockerfile`. Find the pinned-version ARG block:
+Edit `container/Dockerfile`. Find the pinned-version ARG block near the top:
 
 ```dockerfile
-ARG CLAUDE_CODE_VERSION=2.1.116
+ARG CLAUDE_CODE_VERSION=...
 ARG AGENT_BROWSER_VERSION=latest
-ARG VERCEL_VERSION=latest
-ARG BUN_VERSION=1.3.12
+ARG VERCEL_VERSION=...
+ARG BUN_VERSION=...
 ```
 
 Add a new line:
@@ -118,7 +146,7 @@ Add a new line:
 ARG GMAIL_MCP_VERSION=1.1.11
 ```
 
-Then find the last pnpm global-install `RUN` block (the one that installs `@anthropic-ai/claude-code`) and add a new block after it, before `# ---- Entrypoint`:
+Then find the `RUN` block that installs `@anthropic-ai/claude-code` and add a new block after it, before `# ---- ncl CLI wrapper`:
 
 ```dockerfile
 RUN --mount=type=cache,target=/root/.cache/pnpm \
@@ -194,12 +222,37 @@ Run from your NanoClaw project root (where `data/v2.db` lives). The `$[#]` place
 pnpm run build
 ```
 
-Run from your NanoClaw project root:
+Restart the host service. **Stop fully before starting** — the webhook server binds port 3000, and if the dying process still holds the port when the new one starts, it crashes into the circuit-breaker loop:
 
 ```bash
-source setup/lib/install-slug.sh
-launchctl kickstart -k gui/$(id -u)/$(launchd_label)  # macOS
-systemctl --user restart $(systemd_unit)              # Linux
+# Linux
+systemctl --user stop nanoclaw
+# Wait for port 3000 to be released — the process must exit cleanly first
+until ! lsof -i :3000 -t &>/dev/null; do sleep 1; done
+systemctl --user start nanoclaw
+
+# macOS
+launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist
+until ! lsof -i :3000 -t &>/dev/null; do sleep 1; done
+launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
+```
+
+If the service is already in a circuit-breaker loop (repeated `"Circuit breaker: delaying startup"` in the error log), delete the state file before starting (`resetCircuitBreaker()` in `src/circuit-breaker.ts` uses `unlinkSync` — `rm` is the canonical reset, not overwriting with `{}`):
+
+```bash
+# Linux
+systemctl --user stop nanoclaw
+kill $(lsof -i :3000 -t 2>/dev/null) 2>/dev/null
+until ! lsof -i :3000 -t &>/dev/null; do sleep 1; done
+rm -f data/circuit-breaker.json
+systemctl --user start nanoclaw
+
+# macOS
+launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist
+kill $(lsof -i :3000 -t 2>/dev/null) 2>/dev/null
+until ! lsof -i :3000 -t &>/dev/null; do sleep 1; done
+rm -f data/circuit-breaker.json
+launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
 ```
 
 ## Phase 5: Verify
@@ -223,7 +276,16 @@ ls data/v2-sessions/*/stderr.log | head
 Common signals:
 - `command not found: gmail-mcp` → image wasn't rebuilt or PATH doesn't include `/pnpm` (should — `ENV PATH="$PNPM_HOME:$PATH"` in Dockerfile).
 - `ENOENT: no such file or directory, open '/workspace/extra/.gmail-mcp/credentials.json'` → mount is missing. Check `~/.config/nanoclaw/mount-allowlist.json` includes a parent of `~/.gmail-mcp`.
-- `401 Unauthorized` from `gmail.googleapis.com` → OneCLI isn't injecting. Check the agent's secret mode (`onecli agents secrets --id <agent-id>`) and that the Gmail app is connected (`onecli apps get --provider gmail`).
+- `403 Insufficient Permission` from `gmail.googleapis.com` → scope mismatch. The OAuth connection was granted fewer scopes than the operation requires (e.g. connected with read-only but calling `send_email`). Disconnect and reconnect Gmail in the OneCLI web UI with the correct scopes, then re-run Phase 1 scope verification.
+- `401 Unauthorized` from `gmail.googleapis.com` → OneCLI isn't injecting. Check the agent is linked to the Gmail connection:
+  ```bash
+  docker exec onecli-postgres-1 psql -U onecli -d onecli \
+    -c "SELECT a.name, ac.status FROM agent_app_connections aac
+        JOIN agents a ON aac.agent_id = a.id
+        JOIN app_connections ac ON aac.app_connection_id = ac.id
+        WHERE ac.provider = 'gmail';"
+  ```
+  If the agent isn't listed, re-run the "Link each target agent" step in Phase 1.
 - Agent says "I don't have Gmail tools" → the `gmail` MCP server isn't registered in this group's `mcpServers` (re-run the `ncl groups config add-mcp-server` step in Phase 3 for that group and restart it), or the agent-runner image is stale (rebuild with `./container/build.sh`, with `--no-cache` if suspicious).
 
 ## Removal
@@ -241,15 +303,24 @@ Common signals:
      WHERE agent_group_id = '<group-id>';"
    ```
 3. Remove the `GMAIL_MCP_VERSION` ARG and the `pnpm install -g @gongrzhe/server-gmail-autoauth-mcp` block from `container/Dockerfile`.
-4. `pnpm run build && ./container/build.sh && systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"`.
+4. `pnpm run build && ./container/build.sh` then restart using the stop-wait-start pattern from Phase 4.
 5. (Optional) `rm -rf ~/.gmail-mcp/` if no other host-side tool needs the stubs.
-6. (Optional) Disconnect Gmail in OneCLI: `onecli apps disconnect --provider gmail`.
+6. (Optional) Unlink the agent from Gmail in OneCLI Postgres:
+   ```bash
+   docker exec onecli-postgres-1 psql -U onecli -d onecli \
+     -c "DELETE FROM agent_app_connections
+         WHERE agent_id = '<onecli-agent-id>'
+         AND app_connection_id = (SELECT id FROM app_connections WHERE provider = 'gmail');"
+   ```
+7. (Optional) Disconnect Gmail via the OneCLI web UI at http://127.0.0.1:10254 → Apps → Gmail → Disconnect.
 
 No `TOOL_ALLOWLIST` removal step — Phase 2 no longer edits it.
 
 ## Notes
 
 - **Stub format is OneCLI-prescribed.** The `access_token: "onecli-managed"` pattern with `expiry_date: 99999999999999` tells the Google auth client the token is valid; OneCLI intercepts the outgoing Gmail API call and rewrites `Authorization: Bearer onecli-managed` to the real token. `expiry_date: 0` (refresh-interception) is an alternative the OneCLI docs describe — both work but OneCLI's own `migrate` command writes the far-future variant, which is what this skill assumes.
+- **Gmail uses AppConnection, not Secret.** OneCLI stores Gmail OAuth tokens in `app_connections` (Postgres), separate from the `secrets` table used for API keys. The `onecli secrets list` command will not show Gmail. The `secretMode` setting on an agent (`all` vs `selective`) controls Secret injection only and has no effect on Gmail. What controls Gmail injection is the `agent_app_connections` row — if it's missing, OneCLI won't inject even if the app is connected.
+- **OneCLI CLI version gap.** As of v1.1.1, the `onecli` CLI does not expose `apps` subcommands (`apps get`, `apps disconnect`). Use the web UI at http://127.0.0.1:10254 or query Postgres directly. If a future CLI version adds these commands, update this skill.
 - **Scopes are set at OAuth connect time.** If the agent needs scopes beyond what's currently connected (e.g. the user later wants `calendar.readonly` for combined email/calendar workflows), disconnect and reconnect Gmail in the OneCLI web UI with the expanded scope set.
 - **This is tool-only.** Inbound email as a channel (emails trigger the agent) is a separate piece of work — it needs a `src/channels/gmail.ts` adapter that polls the inbox and routes to a messaging group. The pre-v2 qwibitai skill had this; it has not been ported to v2's channel architecture as of v2.0.0.
 
